@@ -427,10 +427,6 @@ def tree_decoding(
     # position_ids = medusa_position_ids + input_ids.shape[1]
     position_ids = update_position_id(medusa_position_ids, attention_mask, input_ids)
     attention_mask = update_attention_mask(attention_mask, tree_candidates)
-<<<<<<< HEAD
-=======
-
->>>>>>> main
     # Use the model to decode the tree candidates. 
     # The model is expected to return logits for the Medusa structure, original logits, and possibly other outputs.
     tree_medusa_logits, outputs, tree_logits = model(
