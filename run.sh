@@ -6,4 +6,5 @@ source ../hf_mirror.sh
 #huggingface-cli download --resume-download  --token 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 $base_model
 export CUDA_VISIBLE_DEVICES=7
 # python -m medusa.inference.cli --model $model_path
-python -m medusa.inference.inference_test --model $model_path
+python -m medusa.inference.inference_test --model $model_path --max-steps 200
+# python -m medusa.inference.origin_inference --model $model_path
