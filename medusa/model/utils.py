@@ -299,7 +299,7 @@ def get_typical_one_token(logit, temperature, posterior_threshold, posterior_alp
     sampled_tokens = torch.multinomial(F.softmax(logit, dim=-1), 1)
     return sampled_tokens
 
-def generate_candidates(medusa_logits, logits, tree_indices, retrieve_indices, temperature = 0, posterior_threshold=0.3, posterior_alpha = 0.09, top_p=0.8, sampling = 'typical', fast = False, valid_length=None):
+def generate_candidates(medusa_last_logits, last_logits, tree_indices, retrieve_indices, temperature = 0, posterior_threshold=0.3, posterior_alpha = 0.09, top_p=0.8, sampling = 'typical', fast = False):
     """
     Generate candidates based on provided logits and indices.
     
@@ -320,13 +320,6 @@ def generate_candidates(medusa_logits, logits, tree_indices, retrieve_indices, t
         1. Cartesian candidates derived from the combined original and Medusa logits.
         2. Tree candidates mapped from the Cartesian candidates using tree indices.
     """
-
-    if valid_length is not None:
-        last_logits = extract_last_valid_logits(logits, valid_length)
-        medusa_last_logits = extract_last_valid_logits(medusa_logits, valid_length)
-    else:
-        last_logits = logits
-        medusa_last_logits = medusa_logits
     # Greedy decoding: Select the most probable candidate from the original logits.
     if temperature == 0 or fast:
         candidates_logit = torch.argmax(last_logits, dim=-1).unsqueeze(-1) ##logits: [bs,seq,vocab], candidates_logit:[bs,1]
@@ -804,3 +797,67 @@ def update_inference_inputs(
     # Update the new token counter
     new_token += max_accept_length
     return input_ids, logits, medusa_logits, new_token, valid_length, attention_mask
+
+def get_new_ids(
+    candidates,
+    retrieve_indices,
+    best_candidate,
+    prev_input_len,
+    valid_length,
+    logits,
+    medusa_logits,
+    padding_token_id=0
+):
+    """
+    Update the input sequences and relevant tensors based on the selected best candidate from the inference results.
+
+    Args:
+    - input_ids (torch.Tensor): Current input token sequences.
+    - candidates (torch.Tensor): Candidate token sequences generated in the current step.
+    - best_candidate (int): Index of the chosen best candidate.
+    - valid_length (int): Length of the accepted candidate sequence.
+    - retrieve_indices (torch.Tensor): Indices to map tree to a cartesian product.
+
+    Returns:
+    - input_ids (torch.Tensor): Updated input token sequences.
+    - logits (torch.Tensor): Updated logits.
+    - medusa_logits (torch.Tensor): Updated medusa logits.
+    """
+    batch_indices = torch.arange(best_candidate.size(0), device=logits.device)
+    # Calculate the starting position for new tokens based on the previous input length
+    # Map the best candidate indices to the original indices in the sequence
+
+    max_valid_length = valid_length.max().item()
+    gather_mask = generate_gather_mask(valid_length, max_valid_length)
+    new_ids = select_new_tokens(candidates, best_candidate, gather_mask, max_valid_length, padding_id=padding_token_id)
+
+    # Extract logits and medusa logits for the last accepted tokens
+    logits = logits[batch_indices, best_candidate, valid_length-1] #最后一个logits
+    medusa_logits = medusa_logits[:, batch_indices, best_candidate, valid_length-1] #最后一个logits
+
+    # select indices for gather past key values
+    max_valid_length = valid_length.max().item()
+    candidate_ids = retrieve_indices[best_candidate]
+    select_indices = generate_gather_indices(gather_mask, max_valid_length, candidate_ids, prev_input_len)
+    
+    return new_ids, select_indices, logits, medusa_logits
+
+def update_input_ids(
+    input_ids,
+    new_ids,
+    select_indices,
+    past_key_values_data,
+    current_length_data,
+    valid_length,
+    attention_mask,
+    padding_token_id=0
+):
+
+
+    input_ids, scatter_index = update_ids_new(input_ids, new_ids, padding_value=padding_token_id)
+    tgt = gather_from_past_key_values(past_key_values_data, select_indices)
+    update_kvcache_new(tgt, past_key_values_data, scatter_index)
+    update_current_length_new(current_length_data, input_ids.shape[-1])
+    attention_mask = update_mask_new(attention_mask, valid_length)
+
+    return input_ids, attention_mask

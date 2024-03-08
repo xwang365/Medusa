@@ -1,3 +1,4 @@
+import copy
 import torch
 import torch.nn as nn
 from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
@@ -7,7 +8,7 @@ import pdb
 # # monkey patch
 # transformers.models.llama.modeling_llama.LlamaForCausalLM = KVLlamaForCausalLM
 # transformers.models.mistral.modeling_mistral.MistralForCausalLM = KVMistralForCausalLM
-import copy
+
 from transformers import PreTrainedModel, PretrainedConfig
 from .utils import *
 from .kv_cache import initialize_past_key_values
@@ -167,6 +168,44 @@ class MedusaModelABC(nn.Module):
         """
         return self.tokenizer
 
+    def model_forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        past_key_values=None,
+        output_orig=False,
+        position_ids=None,
+        **kwargs,
+    ):
+        with torch.inference_mode():
+            # Pass input through the base model
+            outputs = self.base_model.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+                **kwargs,
+            )
+            if output_orig:
+                orig = self.base_model.lm_head(outputs[0])
+        if output_orig:
+            return outputs, orig
+        else:
+            return outputs
+
+    def medusa_head_forward(
+        self,
+        hidden_states,
+        **kwargs,
+    ):
+        # Clone the output hidden states
+        hidden_states = hidden_states.clone()
+        medusa_logits = []
+        # TODO: Consider parallelizing this loop for efficiency?
+        for i in range(self.medusa):
+            medusa_logits.append(self.medusa_head[i](hidden_states))
+        return torch.stack(medusa_logits, dim=0)
+
 
     def forward(
         self,
@@ -200,26 +239,27 @@ class MedusaModelABC(nn.Module):
                 position_ids=position_ids,
                 **kwargs,
             )
-        with torch.inference_mode():
-            # Pass input through the base model
-            outputs = self.base_model.model(
+        if output_orig:
+            outputs, orig = self.model_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                output_orig=True,
+                position_ids=position_ids,
+                **kwargs,
+            )
+        else:
+            outputs = self.model_forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
                 **kwargs,
             )
-            if output_orig:
-                orig = self.base_model.lm_head(outputs[0])
-        # Clone the output hidden states
-        hidden_states = outputs[0].clone()
-        medusa_logits = []
-        # TODO: Consider parallelizing this loop for efficiency?
-        for i in range(self.medusa):
-            medusa_logits.append(self.medusa_head[i](hidden_states))
+        medusa_logits = self.medusa_head_forward(outputs[0])
         if output_orig:
-            return torch.stack(medusa_logits, dim=0), outputs, orig
-        return torch.stack(medusa_logits, dim=0)
+            return medusa_logits, outputs, orig
+        return medusa_logits
 
     def get_medusa_choice(self, model_name):
         if 'vicuna' in model_name:
@@ -233,6 +273,114 @@ class MedusaModelABC(nn.Module):
             return zephyr_stage2
         warnings.warn('Please specify medusa choice configuration!')
         return mc_sim_7b_63
+    
+    def medusa_execute(
+        self,
+        input_ids,
+        attention_mask=None,
+        temperature=0.0,
+        # The hyperparameters below are for the Medusa
+        # top-1 prediciton for the next token, top-7 predictions for the next token, top-6 predictions for the next next token.
+        medusa_choices=None,
+        posterior_threshold=0.09,  # threshold validation of Medusa output
+        # another threshold hyperparameter, recommended to be sqrt(posterior_threshold)
+        posterior_alpha=0.3,
+        top_p=0.8, 
+        sampling = 'typical', 
+        fast = True,
+        model_outputs=None,
+        logits=None,
+        prompt_run=False,
+        candidates=None, # only needed for decode run
+        tree_candidates=None, # only needed for decode run
+    ):
+        if medusa_choices is None:
+            medusa_choices = self.get_medusa_choice(self.base_model_name_or_path)
+
+        if hasattr(self, "medusa_choices") and self.medusa_choices == medusa_choices:
+            # Load the cached medusa buffer
+            medusa_buffers = self.medusa_buffers
+        else:
+            # Initialize the medusa buffer
+            medusa_buffers = generate_medusa_buffers(
+                medusa_choices, device=self.base_model.device
+            )
+        self.medusa_buffers = medusa_buffers
+        self.medusa_choices = medusa_choices
+        if prompt_run:
+            valid_length = attention_mask.sum(dim=1)
+            # Avoid modifying the input_ids in-place
+            input_ids = input_ids.clone()
+            # Cache medusa buffers (the fixed patterns for tree attention)
+
+            reset_medusa_mode(self)
+            medusa_logits = self.medusa_head_forward(model_outputs[0])
+            self.base_model.model.medusa_mask = medusa_buffers["medusa_attn_mask"]
+            last_logits = extract_last_valid_logits(logits, valid_length)
+            last_medusa_logits = extract_last_valid_logits(medusa_logits, valid_length)
+        else:
+            tree_medusa_logits = self.medusa_head_forward(model_outputs[0])
+            tree_logits = logits
+            # Reorder the obtained logits based on the retrieve_indices to ensure consistency with some reference ordering.
+            logits = tree_logits[:, medusa_buffers["retrieve_indices"]]
+            medusa_logits = tree_medusa_logits[:, :, medusa_buffers["retrieve_indices"]]
+
+            # Evaluate the posterior of the candidates to select the accepted candidate prefix
+            best_candidate, accept_length = evaluate_posterior(
+                logits, candidates, temperature, posterior_threshold, posterior_alpha, top_p=top_p, sampling=sampling, fast=fast
+            )
+            # Update the input_ids and logits
+            # if 0 prediction is accepted, we have one new token
+            # because the orginal output of base model is the always correct
+            valid_length = accept_length + 1
+            new_ids, select_indices, last_logits, last_medusa_logits = get_new_ids(
+                candidates,
+                medusa_buffers["retrieve_indices"],
+                best_candidate,
+                input_ids.shape[1],
+                valid_length,
+                logits,
+                medusa_logits,
+                padding_token_id=self.tokenizer.pad_token_id
+            )
+
+            input_ids, attention_mask = update_input_ids(
+                input_ids,
+                new_ids,
+                select_indices,
+                self.past_key_values_data,
+                self.current_length_data,
+                valid_length,
+                attention_mask,
+                padding_token_id=self.tokenizer.pad_token_id
+            )
+
+        # Generate candidates with topk predictions from Medusa heads
+        candidates, tree_candidates = generate_candidates(
+            last_medusa_logits,
+            last_logits,
+            medusa_buffers["tree_indices"],
+            medusa_buffers["retrieve_indices"],
+            temperature=temperature,
+            posterior_alpha=posterior_alpha,
+            posterior_threshold=posterior_threshold,
+            top_p=top_p,
+            sampling=sampling,
+            fast=fast,
+        )
+        # Use tree attention to verify the candidates and get predictions
+        # Compute new position IDs by adding the Medusa position IDs to the length of the input sequence.
+        position_ids_with_medusa = update_position_id(medusa_buffers["medusa_position_ids"], attention_mask, input_ids)
+        attention_mask_with_medusa = update_attention_mask(attention_mask, tree_candidates)
+        cross_step_params = {
+            "attention_mask": attention_mask,
+            "position_ids_with_medusa": position_ids_with_medusa,
+            "attention_mask_with_medusa": attention_mask_with_medusa,
+            "candidates": candidates,
+            "tree_candidates": tree_candidates,
+        }
+        return input_ids, cross_step_params, valid_length
+
 
     def medusa_generate(
         self,
@@ -266,26 +414,17 @@ class MedusaModelABC(nn.Module):
 
         Warning: Only support batch size 1 for now!!
         """
-        # assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
+
+        hyper_params = {
+            "temperature": temperature,
+            "medusa_choices": medusa_choices,
+            "posterior_threshold": posterior_threshold,
+            "posterior_alpha": posterior_alpha,
+            "top_p": top_p,
+            "sampling": sampling,
+            "fast": fast,
+        }
         batch_size = input_ids.shape[0]
-        valid_length = attention_mask.sum(dim=1)
-        # Avoid modifying the input_ids in-place
-        input_ids = input_ids.clone()
-        # Cache medusa buffers (the fixed patterns for tree attention)
-        if medusa_choices is None:
-            medusa_choices = self.get_medusa_choice(self.base_model_name_or_path)
-
-        if hasattr(self, "medusa_choices") and self.medusa_choices == medusa_choices:
-            # Load the cached medusa buffer
-            medusa_buffers = self.medusa_buffers
-        else:
-            # Initialize the medusa buffer
-            medusa_buffers = generate_medusa_buffers(
-                medusa_choices, device=self.base_model.device
-            )
-        self.medusa_buffers = medusa_buffers
-        self.medusa_choices = medusa_choices
-
         # Initialize the past key and value states
         if hasattr(self, "past_key_values") and batch_size==self.past_key_values_data.shape[1]:
             past_key_values = self.past_key_values
@@ -299,79 +438,60 @@ class MedusaModelABC(nn.Module):
                 past_key_values_data,
                 current_length_data,
             ) = initialize_past_key_values(self.base_model, batch_size)
-            self.past_key_values = past_key_values
-            self.past_key_values_data = past_key_values_data
-            self.current_length_data = current_length_data
+        self.past_key_values = past_key_values
+        self.past_key_values_data = past_key_values_data
+        self.current_length_data = current_length_data
 
-        # input_len = input_ids.shape[1]
-        input_len = (input_ids != self.tokenizer.pad_token_id).sum(dim=1)
-
-        reset_medusa_mode(self)
         # Initialize tree attention mask and process prefill tokens
-        medusa_logits, logits = initialize_medusa(
-            input_ids, self, medusa_buffers["medusa_attn_mask"], past_key_values, attention_mask
+        outputs, logits = self.model_forward(
+            input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            output_orig=True,
         )
-        new_token = 0
-        last_round_token = 0
+        input_ids, cross_step_params, valid_length = self.medusa_execute(
+            input_ids,
+            attention_mask=attention_mask,
+            model_outputs=outputs,
+            logits=logits,
+            prompt_run=True,
+            **hyper_params
+        )
+        input_len = (input_ids != self.tokenizer.pad_token_id).sum(dim=1)
         if isinstance(input_len, int):
             ends = [input_len] * batch_size
         else:
             ends = copy.deepcopy(input_len)
 
-        target_lenght = torch.ones(batch_size, dtype=torch.int, device=input_ids.device)*max_steps
-        any_finished = torch.any(target_lenght<=0)
-        all_finished = torch.all(target_lenght<=0)
-        # for idx in range(max_steps):
+        target_length = torch.ones(batch_size, dtype=torch.int, device=input_ids.device)*max_steps
+        any_finished = torch.any(target_length<=0)
+        all_finished = torch.all(target_length<=0)
         while not all_finished:
-            # Generate candidates with topk predictions from Medusa heads
-            candidates, tree_candidates = generate_candidates(
-                medusa_logits,
-                logits,
-                medusa_buffers["tree_indices"],
-                medusa_buffers["retrieve_indices"],
-                temperature=temperature,
-                posterior_alpha=posterior_alpha,
-                posterior_threshold=posterior_threshold,
-                top_p=top_p,
-                sampling=sampling,
-                fast=fast,
-                valid_length=valid_length
+            # Use the model to decode the tree candidates. 
+            # The model is expected to return logits for the Medusa structure, original logits, and possibly other outputs.
+            outputs, tree_logits = self.model_forward(
+                cross_step_params["tree_candidates"],
+                past_key_values=past_key_values,
+                output_orig=True,
+                position_ids=cross_step_params["position_ids_with_medusa"],
+                attention_mask=cross_step_params["attention_mask_with_medusa"],
             )
-            # Use tree attention to verify the candidates and get predictions
-            medusa_logits, logits, outputs = tree_decoding(
-                self,
-                tree_candidates,
-                past_key_values,
-                medusa_buffers["medusa_position_ids"],
+            input_ids, cross_step_params, valid_length = self.medusa_execute(
                 input_ids,
-                medusa_buffers["retrieve_indices"],
-                attention_mask=attention_mask
+                attention_mask=cross_step_params["attention_mask"],
+                **hyper_params,
+                model_outputs=outputs,
+                prompt_run=False,
+                logits=tree_logits,
+                candidates=cross_step_params["candidates"],
+                tree_candidates=cross_step_params["tree_candidates"],
             )
-            # Evaluate the posterior of the candidates to select the accepted candidate prefix
-            best_candidate, accept_length = evaluate_posterior(
-                logits, candidates, temperature, posterior_threshold, posterior_alpha, top_p=top_p, sampling=sampling, fast=fast
-            )
-            # Update the input_ids and logits
-            input_ids, logits, medusa_logits, new_token, valid_length, attention_mask = update_inference_inputs(
-                input_ids,
-                candidates,
-                best_candidate,
-                accept_length,
-                medusa_buffers["retrieve_indices"],
-                outputs,
-                logits,
-                medusa_logits,
-                new_token,
-                past_key_values_data,
-                current_length_data,
-                attention_mask=attention_mask,
-                padding_idx=self.tokenizer.pad_token_id
-            )
+
             decoded_texts = []
             eos_encountered = [False] * batch_size
-            target_lenght -= valid_length
-            any_finished = torch.any(target_lenght<=0)
-            all_finished = torch.all(target_lenght<=0)
+            target_length -= valid_length
+            any_finished = torch.any(target_length<=0)
+            all_finished = torch.all(target_length<=0)
             for i in range(batch_size):
                 if isinstance(input_len, int):
                     input_len_ = input_len
@@ -389,7 +509,7 @@ class MedusaModelABC(nn.Module):
                     clean_up_tokenization_spaces=True,
                 )
                 decoded_texts.append(decoded_text)
-            yield{"text": decoded_texts}
+            yield{ "text": decoded_texts}
 
             # 如果所有批次都遇到了 EOS，则停止
             if all(eos_encountered):
