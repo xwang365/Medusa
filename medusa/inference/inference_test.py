@@ -46,7 +46,7 @@ def main(args):
     attention_mask = encoded_inputs['attention_mask'].to(model.base_model.device) 
     for output in model.medusa_generate(
             input_ids,
-            attention_mask=attention_mask,
+            input_id_mask=attention_mask,
             temperature=args.temperature,
             # temperature=0,
             max_steps=args.max_steps

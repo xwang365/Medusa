@@ -195,28 +195,6 @@ def initialize_medusa(input_ids, model, medusa_attn_mask, past_key_values, atten
     return medusa_logits, logits
 
 
-def reset_medusa_mode(
-    model,
-):
-    """
-    Resets the Medusa settings and the past key-values to their initial state.
-
-    This function ensures that after any operations involving Medusa,
-    the base model and its settings return to their default state.
-    Specifically, it performs the following tasks:
-    1. Clears the Medusa attention mask in the base model.
-    2. Resets the Medusa mode in the base model.
-    3. Resets the current lengths in the past key-values to zero for all layers.
-
-    Args:
-    - model (MedusaLMHead): The model containing the Medusa layers and base model.
-    - past_key_values (list of torch.Tensor): Contains past hidden states and past attention values.
-
-    Returns:
-    - None
-    """
-    model.base_model.model.medusa_mask = None
-    model.base_model.model.medusa_mode = None
 
 def reset_past_key_values(passed_key_values):
     """
@@ -356,16 +334,6 @@ def generate_candidates(medusa_last_logits, last_logits, tree_indices, retrieve_
         torch.Size([2, 64])
     """
 
-def update_position_id(medusa_position_ids, attention_mask, input_ids):
-    bs = input_ids.shape[0]
-    seqlen = medusa_position_ids.shape[0]
-    medusa_position_ids_unsqueezed = torch.unsqueeze(medusa_position_ids, dim=0)
-    medusa_position_ids_repeated = medusa_position_ids_unsqueezed.repeat(bs,1)
-    valid_length = torch.unsqueeze(attention_mask.sum(dim=1), dim=-1)
-    valid_length_repeated = valid_length.repeat(1, seqlen)
-    position_ids = medusa_position_ids_repeated + valid_length_repeated
-    return position_ids
-
 def update_attention_mask(attention_mask, tree_candidates):
     bs = tree_candidates.shape[0]
     n = tree_candidates.shape[1]
@@ -384,14 +352,6 @@ def update_position_id(medusa_position_ids, attention_mask, input_ids):
     valid_length_repeated = valid_length.repeat(1, seqlen)
     position_ids = medusa_position_ids_repeated + valid_length_repeated
     return position_ids
-
-def update_attention_mask(attention_mask, tree_candidates):
-    bs = tree_candidates.shape[0]
-    n = tree_candidates.shape[1]
-    new_tokens = torch.ones((bs, n), dtype=attention_mask.dtype, device=attention_mask.device)
-    extended_attention_mask = torch.cat((attention_mask, new_tokens), dim=1)
-    return extended_attention_mask
-
 
 def tree_decoding(
     model,
@@ -618,10 +578,10 @@ def generate_gather_mask(accept_length, max_accept_length):
     return gather_mask
 
 
-def generate_gather_indices(gather_mask, max_accept_length, candidate_ids, prev_input_len):
+def generate_gather_indices(gather_mask, max_accept_length, candidate_ids):
     batch_size, _ = candidate_ids.shape
     output_indices = torch.full((batch_size, max_accept_length), -1, dtype=torch.long, device=candidate_ids.device)
-    candidate_ids_ = candidate_ids[:, :max_accept_length] + prev_input_len
+    candidate_ids_ = candidate_ids[:, :max_accept_length]
     output = torch.where(gather_mask, candidate_ids_, output_indices)
     return output
 
@@ -715,94 +675,11 @@ def update_kvcache_new(tgt, past_key_values_data, scatter_index):
     expand_scatter_index = scatter_index.unsqueeze(0).unsqueeze(2).unsqueeze(4).expand(n_layers,-1,num_head,-1,hidden_size)
     past_key_values_data.scatter_(3, expand_scatter_index, tgt)
 
-def update_current_length_new(current_length_data, new_lenght):
-    current_length_data.fill_(new_lenght)
-
-def update_inference_inputs(
-    input_ids,
-    candidates,
-    best_candidate,
-    accept_length,
-    retrieve_indices,
-    outputs,
-    logits,
-    medusa_logits,
-    new_token,
-    past_key_values_data,
-    current_length_data,
-    attention_mask,
-    padding_idx=0
-):
-    """
-    Update the input sequences and relevant tensors based on the selected best candidate from the inference results.
-
-    Args:
-    - input_ids (torch.Tensor): Current input token sequences.
-    - candidates (torch.Tensor): Candidate token sequences generated in the current step.
-    - best_candidate (int): Index of the chosen best candidate.
-    - accept_length (int): Length of the accepted candidate sequence.
-    - retrieve_indices (torch.Tensor): Indices to map tree to a cartesian product.
-    - outputs, logits, medusa_logits (torch.Tensor): Model's outputs from the previous inference step.
-    - new_token (int): Counter for the new tokens added during inference.
-    - past_key_values_data (torch.Tensor): Tensor containing past hidden states for the transformer model. [layers, batch_size, head_num, max_seqlen, hidden_size]
-    - current_length_data (torch.Tensor): Tensor containing the current length of sequences in the batch.
-
-    Returns:
-    - input_ids (torch.Tensor): Updated input token sequences.
-    - logits (torch.Tensor): Updated logits.
-    - medusa_logits (torch.Tensor): Updated medusa logits.
-    - new_token (int): Updated counter for the new tokens added.
-    """
-    accept_length += 1 ## accept_length > 0
-    max_accept_length = accept_length.max().item()
-    batch_indices = torch.arange(best_candidate.size(0), device=logits.device)
-    # Calculate the starting position for new tokens based on the previous input length
-    prev_input_len = input_ids.shape[1]
-    # Map the best candidate indices to the original indices in the sequence
-    candidate_ids = retrieve_indices[best_candidate]
-    gather_mask = generate_gather_mask(accept_length, max_accept_length)
-    select_indices = generate_gather_indices(gather_mask, max_accept_length, candidate_ids, prev_input_len)
-    new_ids = select_new_tokens(candidates, best_candidate, gather_mask, max_accept_length, padding_id=padding_idx)
-    if False:
-        # Append the tokens from the best candidate to the input sequence
-        input_ids = update_ids(input_ids, new_ids)
-        # Update the past key values based on the selected tokens
-        # Source tensor that contains relevant past information based on the selected candidate
-        # Destination tensor where the relevant past information will be stored
-        # Copy relevant past information from the source to the destination
-        tgt = gather_from_past_key_values(past_key_values_data, select_indices)
-        update_kvcache(tgt, past_key_values_data, prev_input_len)
-        # Update the current length tensor   
-        update_current_length(current_length_data, prev_input_len, tgt.shape[-2]) 
-        # Update the attention mask tensor 
-        attention_mask = update_mask(attention_mask, accept_length)
-    else:
-        input_ids, scatter_index = update_ids_new(input_ids, new_ids, padding_value=padding_idx)
-        tgt = gather_from_past_key_values(past_key_values_data, select_indices)
-        update_kvcache_new(tgt, past_key_values_data, scatter_index)
-        update_current_length_new(current_length_data, input_ids.shape[-1])
-        attention_mask = update_mask_new(attention_mask, accept_length)
-
-
-    if True:
-        # Extract logits and medusa logits for the accepted tokens
-        logits = logits[batch_indices, best_candidate, : max_accept_length]
-        medusa_logits = medusa_logits[:, batch_indices, best_candidate, : max_accept_length]
-        valid_length = accept_length
-    else:
-        # Extract logits and medusa logits for the last accepted tokens
-        logits = logits[batch_indices, best_candidate, accept_length-1] #最后一个logits
-        medusa_logits = medusa_logits[:, batch_indices, best_candidate, accept_length-1] #最后一个logits
-        valid_length = None
-    # Update the new token counter
-    new_token += max_accept_length
-    return input_ids, logits, medusa_logits, new_token, valid_length, attention_mask
 
 def get_new_ids(
     candidates,
     retrieve_indices,
     best_candidate,
-    prev_input_len,
     valid_length,
     logits,
     medusa_logits,
@@ -838,9 +715,9 @@ def get_new_ids(
     # select indices for gather past key values
     max_valid_length = valid_length.max().item()
     candidate_ids = retrieve_indices[best_candidate]
-    select_indices = generate_gather_indices(gather_mask, max_valid_length, candidate_ids, prev_input_len)
+    medusa_valid_token_idx = generate_gather_indices(gather_mask, max_valid_length, candidate_ids)
     
-    return new_ids, select_indices, logits, medusa_logits
+    return new_ids, medusa_valid_token_idx, logits, medusa_logits
 
 def update_input_ids(
     input_ids,
@@ -857,7 +734,7 @@ def update_input_ids(
     input_ids, scatter_index = update_ids_new(input_ids, new_ids, padding_value=padding_token_id)
     tgt = gather_from_past_key_values(past_key_values_data, select_indices)
     update_kvcache_new(tgt, past_key_values_data, scatter_index)
-    update_current_length_new(current_length_data, input_ids.shape[-1])
+    current_length_data.fill_(input_ids.shape[-1])
     attention_mask = update_mask_new(attention_mask, valid_length)
 
     return input_ids, attention_mask

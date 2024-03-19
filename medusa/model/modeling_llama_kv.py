@@ -248,7 +248,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
-
+tmp_count = 0
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -346,6 +346,13 @@ class LlamaAttention(nn.Module):
             kv_seq_len += past_key_value[0].shape[-2]
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        global tmp_count
+        #print('tmp_count:', tmp_count)
+        #if tmp_count == 32 or tmp_count == 0:
+        #    print('======query:', query_states.shape, query_states)
+        #    print('======key:',key_states.shape, key_states)
+        #    print('======mask:',attention_mask.shape, attention_mask )
+        #    exit()
 
         # [MODIFIED] Using KVCache mechanism for preallocated GPU memory optimization
         # past_key_value is utilized to leverage previously computed key and value states.
@@ -377,6 +384,10 @@ class LlamaAttention(nn.Module):
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
+        #if tmp_count == 32:
+        #    print('======output:',attn_output.shape, attn_output)
+        #    exit()
+        #tmp_count += 1
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
